@@ -1,0 +1,645 @@
+//Eliyas Science Info www.youtube.com/c/eliyasscienceinfo
+//IoT Smart Parking System - Admin Control Edition
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+// Hardware pins
+#define IR_ENTRY  18
+#define PIR_EXIT  19
+#define SERVO_PIN 25
+#define GREEN_LED 26
+#define RED_LED   27
+
+Servo barrierServo;
+
+const char* ssid     = "Eliyas";
+const char* password = "0123456789";
+
+WebServer server(80);
+
+// --- State ---
+int totalSlots     = 4;
+int availableSlots = 4;
+int flagEntry      = 0;
+int flagExit       = 0;
+String gateStatus  = "Closed";
+
+// Admin controls
+bool systemLocked     = false;  // locks all sensor detection
+bool gateOverride     = false;  // admin manually opened gate
+String lastActivity   = "System started";
+
+// PIR timing
+unsigned long pirHighStart      = 0;
+bool pirTriggered               = false;
+const unsigned long PIR_HOLD_MS = 300;
+
+// Entry cooldown
+unsigned long lastEntryTime          = 0;
+const unsigned long EXIT_COOLDOWN_MS = 5000;
+
+// ---------------- Helpers ----------------
+void openGate() {
+  gateStatus = "Open";
+  barrierServo.write(0);
+}
+
+void closeGate() {
+  barrierServo.write(90);
+  gateStatus = "Closed";
+}
+
+void updateLEDs() {
+  if (availableSlots > 0) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED,   LOW);
+  } else {
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED,   HIGH);
+  }
+}
+
+// ---------------- API Handlers ----------------
+void handleData() {
+  String json = "{";
+  json += "\"available\":"   + String(availableSlots) + ",";
+  json += "\"occupied\":"    + String(totalSlots - availableSlots) + ",";
+  json += "\"total\":"       + String(totalSlots) + ",";
+  json += "\"gate\":\""      + gateStatus + "\",";
+  json += "\"locked\":"      + String(systemLocked ? "true" : "false") + ",";
+  json += "\"activity\":\""  + lastActivity + "\",";
+  json += "\"occupied_slots\":[";
+  int occ = totalSlots - availableSlots;
+  for (int i = 1; i <= occ; i++) {
+    json += String(i);
+    if (i < occ) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+// Admin: Open gate manually
+void handleAdminGateOpen() {
+  if (!gateOverride) {
+    gateOverride = true;
+    openGate();
+    lastActivity = "Admin opened gate";
+    Serial.println("[ADMIN] Gate opened manually");
+  }
+  server.send(200, "application/json", "{\"status\":\"gate_opened\"}");
+}
+
+// Admin: Close gate manually
+void handleAdminGateClose() {
+  if (gateOverride) {
+    gateOverride = false;
+    closeGate();
+    lastActivity = "Admin closed gate";
+    Serial.println("[ADMIN] Gate closed manually");
+  }
+  server.send(200, "application/json", "{\"status\":\"gate_closed\"}");
+}
+
+// Admin: Lock system (ignore sensors)
+void handleAdminLock() {
+  systemLocked = true;
+  closeGate();
+  lastActivity = "System locked by admin";
+  Serial.println("[ADMIN] System locked");
+  server.send(200, "application/json", "{\"status\":\"locked\"}");
+}
+
+// Admin: Unlock system
+void handleAdminUnlock() {
+  systemLocked = false;
+  lastActivity = "System unlocked by admin";
+  Serial.println("[ADMIN] System unlocked");
+  server.send(200, "application/json", "{\"status\":\"unlocked\"}");
+}
+
+// Admin: Add a slot manually (e.g. override wrong count)
+void handleAdminSlotAdd() {
+  if (availableSlots < totalSlots) {
+    availableSlots++;
+    updateLEDs();
+    lastActivity = "Admin added 1 slot";
+    Serial.println("[ADMIN] Slot added");
+  }
+  server.send(200, "application/json", "{\"status\":\"slot_added\"}");
+}
+
+// Admin: Remove a slot manually
+void handleAdminSlotRemove() {
+  if (availableSlots > 0) {
+    availableSlots--;
+    updateLEDs();
+    lastActivity = "Admin removed 1 slot";
+    Serial.println("[ADMIN] Slot removed");
+  }
+  server.send(200, "application/json", "{\"status\":\"slot_removed\"}");
+}
+
+// Admin: Reset slots to full
+void handleAdminReset() {
+  availableSlots = totalSlots;
+  updateLEDs();
+  lastActivity = "Admin reset all slots";
+  Serial.println("[ADMIN] Slots reset to full");
+  server.send(200, "application/json", "{\"status\":\"reset\"}");
+}
+
+// ---------------- HTML Dashboard ----------------
+String getHTML() {
+  return R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ParkAdmin</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0f1117;
+    --surface:  #181c27;
+    --border:   #252a38;
+    --text:     #e8eaf0;
+    --muted:    #6b7280;
+    --green:    #22c55e;
+    --red:      #ef4444;
+    --amber:    #f59e0b;
+    --blue:     #3b82f6;
+    --accent:   #6366f1;
+  }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 20px 16px 40px;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .header-left h1 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.3px;
+  }
+  .header-left span {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+  }
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+    margin-right: 6px;
+    box-shadow: 0 0 6px var(--green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity:1; } 50% { opacity:0.4; }
+  }
+
+  /* Stat cards */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 14px;
+  }
+  .stat-label {
+    font-size: 0.65rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+  .stat-value {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1;
+    font-family: 'DM Mono', monospace;
+  }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red   { color: var(--red);   }
+  .stat-value.blue  { color: var(--blue);  }
+
+  /* Gate card */
+  .gate-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .gate-info .label {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .gate-info .value {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+  .gate-info .value.open   { color: var(--green); }
+  .gate-info .value.closed { color: var(--red);   }
+
+  /* Slots grid */
+  .slots-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .section-title {
+    font-size: 0.7rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 12px;
+  }
+  .slots-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+  .slot {
+    border-radius: 10px;
+    padding: 12px 6px;
+    text-align: center;
+    border: 1px solid transparent;
+    transition: all 0.3s;
+  }
+  .slot.available {
+    background: rgba(34,197,94,0.08);
+    border-color: rgba(34,197,94,0.25);
+  }
+  .slot.occupied {
+    background: rgba(239,68,68,0.08);
+    border-color: rgba(239,68,68,0.25);
+  }
+  .slot-num {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  .slot.available .slot-num { color: var(--green); }
+  .slot.occupied  .slot-num { color: var(--red);   }
+  .slot-lbl {
+    font-size: 0.55rem;
+    margin-top: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  /* Admin panel */
+  .admin-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .admin-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .btn {
+    border: none;
+    border-radius: 10px;
+    padding: 12px 10px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    letter-spacing: 0.01em;
+  }
+  .btn:active { transform: scale(0.96); }
+
+  .btn-green  { background: rgba(34,197,94,0.15);  color: var(--green); border: 1px solid rgba(34,197,94,0.3); }
+  .btn-red    { background: rgba(239,68,68,0.15);  color: var(--red);   border: 1px solid rgba(239,68,68,0.3); }
+  .btn-amber  { background: rgba(245,158,11,0.15); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }
+  .btn-blue   { background: rgba(59,130,246,0.15); color: var(--blue);  border: 1px solid rgba(59,130,246,0.3); }
+  .btn-accent { background: rgba(99,102,241,0.15); color: var(--accent);border: 1px solid rgba(99,102,241,0.3); }
+  .btn-full   { grid-column: span 2; }
+
+  .btn:hover { filter: brightness(1.2); }
+
+  /* Lock banner */
+  .lock-banner {
+    background: rgba(239,68,68,0.1);
+    border: 1px solid rgba(239,68,68,0.3);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 0.8rem;
+    color: var(--red);
+    text-align: center;
+    margin-bottom: 16px;
+    display: none;
+  }
+  .lock-banner.visible { display: block; }
+
+  /* Activity log */
+  .activity {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+  }
+  #activity-text {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--accent);
+    margin-top: 6px;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 20px; left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 0.8rem;
+    color: var(--text);
+    transition: transform 0.3s ease;
+    z-index: 99;
+    white-space: nowrap;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <h1><span class="status-dot"></span>ParkAdmin</h1>
+    <span id="ip-label">ESP32 Dashboard</span>
+  </div>
+  <span style="font-size:0.7rem;color:var(--muted);font-family:'DM Mono',monospace" id="clock">--:--:--</span>
+</div>
+
+<div id="lock-banner" class="lock-banner">⚠ System Locked — Sensors Disabled</div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="stat-label">Available</div>
+    <div class="stat-value green" id="available">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Occupied</div>
+    <div class="stat-value red" id="occupied">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Capacity</div>
+    <div class="stat-value blue" id="total">—</div>
+  </div>
+</div>
+
+<div class="gate-card">
+  <div class="gate-info">
+    <div class="label">Gate Status</div>
+    <div class="value closed" id="gate">—</div>
+  </div>
+  <div style="text-align:right">
+    <div class="label" style="font-size:0.65rem;color:var(--muted);">Last Event</div>
+    <div style="font-size:0.72rem;margin-top:2px;color:var(--text);max-width:140px;text-align:right" id="activity-inline">—</div>
+  </div>
+</div>
+
+<div class="slots-section">
+  <div class="section-title">Slot Layout</div>
+  <div class="slots-grid" id="slots"></div>
+</div>
+
+<div class="admin-section">
+  <div class="section-title">Admin Controls</div>
+  <div class="admin-grid">
+    <button class="btn btn-green" onclick="api('/admin/gate/open')">▲ Open Gate</button>
+    <button class="btn btn-red"   onclick="api('/admin/gate/close')">▼ Close Gate</button>
+    <button class="btn btn-blue"  onclick="api('/admin/slot/add')">＋ Add Slot</button>
+    <button class="btn btn-amber" onclick="api('/admin/slot/remove')">－ Remove Slot</button>
+    <button class="btn btn-accent btn-full" onclick="api('/admin/reset')">↺ Reset All Slots</button>
+    <button class="btn btn-red   btn-full" id="lock-btn" onclick="toggleLock()">🔒 Lock System</button>
+  </div>
+</div>
+
+<div class="activity">
+  <div class="section-title">Last Activity</div>
+  <div id="activity-text">Waiting...</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  let isLocked = false;
+
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2200);
+  }
+
+  async function api(endpoint) {
+    try {
+      const res = await fetch(endpoint);
+      const data = await res.json();
+      showToast('✓ ' + (data.status || 'Done').replace(/_/g,' '));
+      await updateData();
+    } catch(e) { showToast('✗ Request failed'); }
+  }
+
+  async function toggleLock() {
+    const endpoint = isLocked ? '/admin/unlock' : '/admin/lock';
+    await api(endpoint);
+  }
+
+  async function updateData() {
+    try {
+      const res  = await fetch('/data');
+      const data = await res.json();
+
+      document.getElementById('available').textContent = data.available;
+      document.getElementById('occupied').textContent  = data.occupied;
+      document.getElementById('total').textContent     = data.total;
+
+      const gateEl = document.getElementById('gate');
+      gateEl.textContent = data.gate;
+      gateEl.className   = 'value ' + (data.gate === 'Open' ? 'open' : 'closed');
+
+      document.getElementById('activity-text').textContent   = data.activity;
+      document.getElementById('activity-inline').textContent = data.activity;
+
+      isLocked = data.locked;
+      const banner  = document.getElementById('lock-banner');
+      const lockBtn = document.getElementById('lock-btn');
+      if (data.locked) {
+        banner.classList.add('visible');
+        lockBtn.textContent = '🔓 Unlock System';
+        lockBtn.className   = 'btn btn-green btn-full';
+      } else {
+        banner.classList.remove('visible');
+        lockBtn.textContent = '🔒 Lock System';
+        lockBtn.className   = 'btn btn-red btn-full';
+      }
+
+      // Render slots
+      let html = '';
+      for (let i = 1; i <= data.total; i++) {
+        const occ = data.occupied_slots.includes(i);
+        html += `<div class="slot ${occ ? 'occupied' : 'available'}">
+          <div class="slot-num">${i}</div>
+          <div class="slot-lbl">${occ ? 'Busy' : 'Free'}</div>
+        </div>`;
+      }
+      document.getElementById('slots').innerHTML = html;
+
+    } catch(e) { console.error('Fetch failed', e); }
+  }
+
+  // Clock
+  function tick() {
+    document.getElementById('clock').textContent =
+      new Date().toLocaleTimeString('en-US',{hour12:false});
+  }
+  setInterval(tick, 1000); tick();
+
+  setInterval(updateData, 2500);
+  window.onload = updateData;
+</script>
+</body>
+</html>
+)rawliteral";
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(IR_ENTRY,  INPUT);
+  pinMode(PIR_EXIT,  INPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED,   OUTPUT);
+
+  barrierServo.attach(SERVO_PIN);
+  barrierServo.write(90);
+  updateLEDs();
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nIP: " + WiFi.localIP().toString());
+
+  // Routes
+  server.on("/",                  []() { server.send(200, "text/html", getHTML()); });
+  server.on("/data",              handleData);
+  server.on("/admin/gate/open",   handleAdminGateOpen);
+  server.on("/admin/gate/close",  handleAdminGateClose);
+  server.on("/admin/lock",        handleAdminLock);
+  server.on("/admin/unlock",      handleAdminUnlock);
+  server.on("/admin/slot/add",    handleAdminSlotAdd);
+  server.on("/admin/slot/remove", handleAdminSlotRemove);
+  server.on("/admin/reset",       handleAdminReset);
+
+  server.begin();
+  lastActivity = "System online";
+}
+
+// ---------------- Loop ----------------
+void loop() {
+  server.handleClient();
+
+  // Skip sensor logic if locked or gate is in admin override
+  if (systemLocked || gateOverride) return;
+
+  // --- Entry: IR sensor ---
+  if (digitalRead(IR_ENTRY) == LOW && flagEntry == 0) {
+    flagEntry = 1;
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED,   HIGH);
+
+    if (availableSlots > 0) {
+      openGate();
+      delay(2000);
+      closeGate();
+      availableSlots--;
+      lastEntryTime = millis();
+      lastActivity  = "Car entered";
+      Serial.println("[ENTRY] Car entered. Slots left: " + String(availableSlots));
+    } else {
+      lastActivity = "Entry blocked - full";
+      Serial.println("[ENTRY] Parking full");
+    }
+    updateLEDs();
+  }
+  if (digitalRead(IR_ENTRY) == HIGH && flagEntry == 1) {
+    flagEntry = 0;
+    updateLEDs();
+  }
+
+  // --- Exit: PIR sensor with cooldown ---
+  int pirState = digitalRead(PIR_EXIT);
+
+  if (pirState == HIGH) {
+    if (!pirTriggered) {
+      pirHighStart = millis();
+      pirTriggered = true;
+    } else {
+      bool cooldownOver = (millis() - lastEntryTime) >= EXIT_COOLDOWN_MS;
+      if ((millis() - pirHighStart) >= PIR_HOLD_MS && flagExit == 0 && cooldownOver) {
+        flagExit = 1;
+        if (availableSlots < totalSlots) {
+          openGate();
+          delay(2000);
+          closeGate();
+          availableSlots++;
+          lastActivity = "Car exited";
+          Serial.println("[EXIT] Car exited. Slots left: " + String(availableSlots));
+        }
+        updateLEDs();
+      }
+    }
+  } else {
+    pirTriggered = false;
+    pirHighStart = 0;
+    flagExit     = 0;
+  }
+}
